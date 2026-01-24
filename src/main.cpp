@@ -3,6 +3,7 @@
 #include <avr/interrupt.h>
 #include <pololu713.cpp>
 #include <PID_v1.h>
+#include <IRremote.hpp>
 #include "../QTRSensors/QTRSensors.h"
 
 // POLOLU-713
@@ -18,7 +19,14 @@
 // status LED
 #define led_red PB2
 #define led_green A2
-#define led_blue A3
+
+//starting
+#define IRDA A3
+#define IR_START 0xBF3F
+#define IR_STOP 0xBE3E
+#define IR_LEFT 0xA121
+#define IR_RIGHT 0xA020
+
 
 // distance sensors (analog pins — also used as digital)
 #define left_sensor A4
@@ -32,17 +40,9 @@
 #define start_pin 4
 #define kill_pin 2
 
-// start jumper pins (PD0 = D0, PD1 = D1)
-#define START_LEFT_PIN  0  // PD0
-#define START_RIGHT_PIN 1  // PD1
-
 // global start direction: -1 = left, 1 = right, 0 = none/both
 int startDirection = 0;
 bool initialManeuverDone = false;
-
-// run state machine for start/kill
-enum RobotState { POWER_ON, STARTED, STOPPED };
-RobotState robotState = POWER_ON;
 
 Motor motor;
 
@@ -61,6 +61,7 @@ static int clampInt(int v, int lo, int hi) {
   if (v > hi) return hi;
   return v;
 }
+
 static void spinClockwise(int speed) {
   int pwm = clampInt(abs(speed), 0, 255);
   digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH); // left forward
@@ -123,18 +124,30 @@ int rightDetectCounter = 0;
 
 unsigned long lastTime = 0;
 
+bool startSignal = false;
+bool killSignal = false;
+
+// State machine for maneuvers
+enum RobotState {
+  SEARCHING,
+  INITIAL_MANEUVER,
+  INITIAL_MANEUVER_STOP,
+  RECOVER_BOTH_BACKUP,
+  RECOVER_BOTH_SPIN,
+  RECOVER_LEFT_BACKUP,
+  RECOVER_LEFT_PIVOT,
+  RECOVER_RIGHT_BACKUP,
+  RECOVER_RIGHT_PIVOT,
+  MANEUVER_STOP
+};
+RobotState robotState = SEARCHING;
+unsigned long maneuverStartTime = 0;
+
 void runRobotLogic(); // Function prototype
 
-void recoverEdge() {
-  motor.backward(200);
-  delay(200);
-  motor.right(180);
-  delay(300);
-  motor.forward(0);
-}
-
 void setup() {
-  // Serial.begin(9600); // commented per request
+   Serial.begin(115200);
+   Serial.println("Robot gotowy do wkurwiania. Zegar 8MHz OK."); // commented per request
 
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){A0, A1}, 2);
@@ -148,25 +161,15 @@ void setup() {
   for (uint8_t i = 0; i < 100; i++) { qtr.calibrate(); delay(20); }
   for (int i = 0; i < 400; i++) { qtr2.calibrate(); delay(1); }
 
-  // start jumper pins
-  pinMode(START_LEFT_PIN, INPUT);
-  pinMode(START_RIGHT_PIN, INPUT);
-  bool left_jumper  = digitalRead(START_LEFT_PIN)  == HIGH;
-  bool right_jumper = digitalRead(START_RIGHT_PIN) == HIGH;
-  if (left_jumper && !right_jumper) startDirection = -1;
-  else if (right_jumper && !left_jumper) startDirection = 1;
-  else startDirection = 0;
-
   // configure LED pins before any digitalWrite
   pinMode(led_red, OUTPUT);
   pinMode(led_green, OUTPUT);
-  pinMode(led_blue, OUTPUT);
+  
+  pinMode(IRDA, INPUT_PULLUP);
+  IrReceiver.begin(IRDA, ENABLE_LED_FEEDBACK);
 
-  // initial visual: POWER_ON -> RED
-  robotState = POWER_ON;
   digitalWrite(led_red, HIGH);
   digitalWrite(led_green, LOW);
-  digitalWrite(led_blue, LOW);
 
   pinMode(sensorPin1, INPUT);
   pinMode(sensorPin2, INPUT);
@@ -189,7 +192,6 @@ void setup() {
   // ensure red LED stays on at boot
   digitalWrite(led_red, HIGH);
   digitalWrite(led_green, LOW);
-  digitalWrite(led_blue, LOW);
 
   // configure PID
   pidSetpoint = 0.0;
@@ -199,139 +201,177 @@ void setup() {
 }
 
 void loop() {
+  // Check for IR commands as often as possible, outside the main logic loop
+  if (IrReceiver.decode()) {
+    Serial.println(IrReceiver.decodedIRData.decodedRawData, HEX); // Print "old" raw data
+    // IrReceiver.printIRResultShort(&Serial); // Print complete received data in one line
+    // IrReceiver.printIRSendUsage(&Serial);   // Print the statement required to send this data
+    
+    if (IrReceiver.decodedIRData.decodedRawData == IR_START) {
+      //Serial.println("START");
+      startSignal = true;
+      killSignal = false;
+      // Reset state on start
+      robotState = SEARCHING;
+      initialManeuverDone = false; 
+    } else if (IrReceiver.decodedIRData.decodedRawData == IR_STOP) {
+      //Serial.println("STOP");
+      killSignal = true;
+      startSignal = false;
+    } else if (IrReceiver.decodedIRData.decodedRawData == IR_LEFT) {
+      //Serial.println("LEFT");
+      if (!startSignal) startDirection = -1; // Allow setting direction only before start
+    } else if (IrReceiver.decodedIRData.decodedRawData == IR_RIGHT) {
+      //Serial.println("RIGHT");
+      if (!startSignal) startDirection = 1; // Allow setting direction only before start
+    }
+    IrReceiver.resume();
+  }
+
+  // Run the main robot logic at a fixed interval
   unsigned long now = millis();
-  if (lastTime == 0) lastTime = now;
-  unsigned long elapsed = now - lastTime;
-  if (elapsed < LOOP_MS) { delay(LOOP_MS - elapsed); now = millis(); elapsed = now - lastTime; }
+  if (now - lastTime < LOOP_MS) {
+    return; // Not time yet
+  }
   lastTime = now;
 
-  // --- State Machine Logic based on Start Module ---
-  bool startSignal = digitalRead(start_pin);
-  bool killSignal = digitalRead(kill_pin);
-
-  // State transitions
-  switch (robotState) {
-    case POWER_ON:
-      digitalWrite(led_red, HIGH);
-      digitalWrite(led_green, LOW);
-      motor.forward(0);
-      if (startSignal == HIGH && killSignal == HIGH) {
-        robotState = STARTED;
-      }
-      break;
-
-    case STARTED:
-      digitalWrite(led_red, LOW);
-      digitalWrite(led_green, HIGH);
-      runRobotLogic();
-      if (startSignal == LOW && killSignal == LOW) {
-        robotState = STOPPED;
-      }
-      break;
-
-    case STOPPED:
-      motor.forward(0);
-      bool ledState = (millis() / 500) % 2;
-      digitalWrite(led_red, ledState ? HIGH : LOW);
-      digitalWrite(led_green, LOW);
-      // Terminal state, requires reset
-      break;
+  if(startSignal && !killSignal) {
+    digitalWrite(led_red, LOW);
+    digitalWrite(led_green, HIGH);
+    runRobotLogic();
+  } else {
+    motor.forward(0);
+    bool ledState = (millis() / 500) % 2;
+    digitalWrite(led_red, ledState ? HIGH : LOW);
+    digitalWrite(led_green, LOW);
   }
 }
 
 void runRobotLogic() {
-  // This function contains the core operational logic from the original loop()
+  unsigned long currentTime = millis();
 
-  // Perform initial start maneuver based on jumper setting
-  if (!initialManeuverDone) {
-    if (startDirection == -1) { // left
-      spinCounterClockwise(SEARCH_SPEED);
-      delay(350);
-    } else if (startDirection == 1) { // right
-      spinClockwise(SEARCH_SPEED);
-      delay(350);
-    }
-    // if startDirection is 0, do nothing and proceed to search
-    initialManeuverDone = true;
-    motor.forward(0); // Stop briefly before continuing
-    delay(100);
-  }
+  // State machine for maneuvers
+  switch (robotState) {
+    case INITIAL_MANEUVER:
+      if (startDirection == -1) spinCounterClockwise(SEARCH_SPEED);
+      else if (startDirection == 1) spinClockwise(SEARCH_SPEED);
+      maneuverStartTime = currentTime;
+      robotState = INITIAL_MANEUVER_STOP;
+      break;
 
-  // read QTR sensors
-  qtr.read(sensorValues);   // A0/A1
-  qtr2.read(sensorValues2); // A4/A5 analogs used for PID
+    case INITIAL_MANEUVER_STOP:
+      if (currentTime - maneuverStartTime >= 350) {
+        motor.forward(0);
+        maneuverStartTime = currentTime;
+        robotState = SEARCHING; // Or a brief pause state
+      }
+      break;
 
-  int qtrL = sensorValues[0];
-  int qtrR = sensorValues[1];
-
-  // line detection (QTR-1A): 1023 = black, smaller = white (line)
-  bool left_line_detect  = (qtrL < EDGE_THRESHOLD);
-  bool right_line_detect = (qtrR < EDGE_THRESHOLD);
-
-  if (left_line_detect || right_line_detect) {
-    if (left_line_detect && right_line_detect) {
-      // Both sensors see the line, emergency reverse and turn
+    case RECOVER_BOTH_BACKUP:
       motor.backward(200);
-      delay(250);
-      spinClockwise(180); // Spin right
-      delay(400);
-    } else if (left_line_detect) {
-      // Left sensor sees the line, pivot right
-      motor.backward(100); // short backup
-      delay(150);
-      pivotRight(180);
-      delay(300);
-    } else if (right_line_detect) {
-      // Right sensor sees the line, pivot left
-      motor.backward(100); // short backup
-      delay(150);
-      pivotLeft(180);
-      delay(300);
-    }
-    motor.forward(0); // Stop after maneuver
-    delay(50);
-    leftDetectCounter = 0;
-    rightDetectCounter = 0;
-    return;
+      maneuverStartTime = currentTime;
+      robotState = RECOVER_BOTH_SPIN;
+      break;
+
+    case RECOVER_BOTH_SPIN:
+      if (currentTime - maneuverStartTime >= 250) {
+        spinClockwise(180);
+        maneuverStartTime = currentTime;
+        robotState = MANEUVER_STOP;
+      }
+      break;
+
+    case RECOVER_LEFT_BACKUP:
+      motor.backward(100);
+      maneuverStartTime = currentTime;
+      robotState = RECOVER_LEFT_PIVOT;
+      break;
+
+    case RECOVER_LEFT_PIVOT:
+      if (currentTime - maneuverStartTime >= 150) {
+        pivotRight(180);
+        maneuverStartTime = currentTime;
+        robotState = MANEUVER_STOP;
+      }
+      break;
+
+    case RECOVER_RIGHT_BACKUP:
+      motor.backward(100);
+      maneuverStartTime = currentTime;
+      robotState = RECOVER_RIGHT_PIVOT;
+      break;
+
+    case RECOVER_RIGHT_PIVOT:
+      if (currentTime - maneuverStartTime >= 150) {
+        pivotLeft(180);
+        maneuverStartTime = currentTime;
+        robotState = MANEUVER_STOP;
+      }
+      break;
+
+    case MANEUVER_STOP:
+      if (currentTime - maneuverStartTime >= 300) { // Duration for pivot/spin
+        motor.forward(0);
+        maneuverStartTime = currentTime;
+        robotState = SEARCHING;
+      }
+      break;
+
+    case SEARCHING:
+      // This is the default state where we check sensors and decide what to do
+      if (!initialManeuverDone) {
+        initialManeuverDone = true;
+        robotState = INITIAL_MANEUVER;
+        break;
+      }
+      
+      qtr.read(sensorValues);
+      qtr2.read(sensorValues2);
+      int qtrL = sensorValues[0];
+      int qtrR = sensorValues[1];
+      bool left_line_detect = (qtrL < EDGE_THRESHOLD);
+      bool right_line_detect = (qtrR < EDGE_THRESHOLD);
+
+      if (left_line_detect || right_line_detect) {
+        if (left_line_detect && right_line_detect) {
+          robotState = RECOVER_BOTH_BACKUP;
+        } else if (left_line_detect) {
+          robotState = RECOVER_LEFT_BACKUP;
+        } else {
+          robotState = RECOVER_RIGHT_BACKUP;
+        }
+        break;
+      }
+
+      // Opponent detection logic remains here
+      int rawRightDigital = digitalRead(sensorPin1);
+      int rawLeftDigital = digitalRead(sensorPin2);
+
+      if (rawLeftDigital == LOW) {
+        if (leftDetectCounter < DEBOUNCE_COUNT) leftDetectCounter++;
+      } else {
+        if (leftDetectCounter > 0) leftDetectCounter--;
+      }
+      if (rawRightDigital == LOW) {
+        if (rightDetectCounter < DEBOUNCE_COUNT) rightDetectCounter++;
+      } else {
+        if (rightDetectCounter > 0) rightDetectCounter--;
+      }
+
+      bool left_detected = (leftDetectCounter >= DEBOUNCE_COUNT);
+      bool right_detected = (rightDetectCounter >= DEBOUNCE_COUNT);
+
+      if (left_detected || right_detected) {
+        if (left_detected && !right_detected) {
+          motor.left(BASE_SPEED);
+        } else if (right_detected && !left_detected) {
+          motor.right(BASE_SPEED);
+        } else {
+          motor.forward(BASE_SPEED);
+        }
+      } else {
+        spinClockwise(SEARCH_SPEED);
+      }
+      break;
   }
-
-  // digital distance sensors A4/A5 used as digital inputs (LOW = detected)
-  int rawRightDigital = digitalRead(sensorPin1);
-  int rawLeftDigital  = digitalRead(sensorPin2);
-
-  if (rawLeftDigital == LOW) {
-    if (leftDetectCounter < DEBOUNCE_COUNT) leftDetectCounter++;
-  } else {
-    if (leftDetectCounter > 0) leftDetectCounter--;
-  }
-  if (rawRightDigital == LOW) {
-    if (rightDetectCounter < DEBOUNCE_COUNT) rightDetectCounter++;
-  } else {
-    if (rightDetectCounter > 0) rightDetectCounter--;
-  }
-
-  // PID correction from analog A4/A5 pair
-  pidInput = (double)((int)sensorValues2[0] - (int)sensorValues2[1]);
-  myPID.Compute();
-  // int corr = (int)round(pidOutput); // Unused variable
-
-  bool left_detected  = (leftDetectCounter  >= DEBOUNCE_COUNT);
-  bool right_detected = (rightDetectCounter >= DEBOUNCE_COUNT);
-
-  // if (left_detected || right_detected) {
-  //   // Opponent detected, ATTACK!
-  //   if (left_detected && !right_detected) {
-  //     // Opponent on the left. Turn left to face it.
-  //     motor.left(BASE_SPEED);
-  //   } else if (right_detected && !left_detected) {
-  //     // Opponent on the right. Turn right to face it.
-  //     motor.right(BASE_SPEED);
-  //   } else {
-  //     // Opponent is (roughly) straight ahead. Full speed forward.
-  //     motor.forward(BASE_SPEED);
-  //   }
-  // } else {
-  //   // No opponent, search.
-  //   spinClockwise(SEARCH_SPEED);
-  // }
 }
