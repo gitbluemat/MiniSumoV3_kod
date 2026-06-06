@@ -3,6 +3,7 @@
 #include <avr/interrupt.h>
 #include <pololu713.cpp>
 #include <PID_v1.h>
+#define IR_USE_AVR_TIMER1
 #include <IRremote.hpp>
 #include "../QTRSensors/QTRSensors.h"
 
@@ -20,12 +21,22 @@
 #define led_red PB2
 #define led_green A2
 
-//starting
+// IR remote
 #define IRDA A3
-#define IR_START 0xBF3F
-#define IR_STOP 0xBE3E
-#define IR_LEFT 0xA121
-#define IR_RIGHT 0xA020
+#define IR_START_RIGHT_RAW 0x85050080UL
+#define IR_START_RIGHT_RAW_ALT 0xA020UL
+#define IR_START_RIGHT_RAW_ALT2 0xA0200080UL
+#define IR_START_LEFT_RAW 0xB2320080UL
+#define IR_START_LEFT_RAW_ALT 0xB232UL
+#define IR_STOP_RAW 0xBF3F0080UL
+#define IR_STOP_RAW_ALT_SHORT 0xBF3FUL
+#define IR_STOP_RAW_ALT 0xBE3E0080UL
+#define IR_STOP_RAW_ALT2 0xBE3EUL
+#define IR_REMOTE_ADDRESS_SHORT 0x80U
+#define IR_STOP_COMMAND_SHORT 0x3FU
+#define IR_STOP_COMMAND_SHORT_ALT 0x3EU
+#define IR_STOP_COMMAND_LONG 0xBF3FU
+#define IR_STOP_COMMAND_LONG_ALT 0xBE3EU
 
 
 // distance sensors (analog pins — also used as digital)
@@ -40,7 +51,7 @@
 #define start_pin 4
 #define kill_pin 2
 
-// global start direction: -1 = left, 1 = right, 0 = none/both
+// -1 = left, 1 = right, 0 = none/both
 int startDirection = 0;
 bool initialManeuverDone = false;
 
@@ -55,11 +66,19 @@ uint16_t sensorValues2[2];
 const int sensorPin1 = A5; // right
 const int sensorPin2 = A4; // left
 
-// helpers
 static int clampInt(int v, int lo, int hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
   return v;
+}
+
+static void stopMotors() {
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW);
+  digitalWrite(BIN2, LOW);
 }
 
 static void spinClockwise(int speed) {
@@ -75,17 +94,17 @@ static void spinCounterClockwise(int speed) {
   analogWrite(PWMA, pwm); analogWrite(PWMB, pwm);
 }
 
-static void pivotRight(int speed) { // Turn right -> left wheel fwd, right wheel stop
+static void pivotRight(int speed) {
   int pwm = clampInt(abs(speed), 0, 255);
-  digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH); // left forward
-  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);  // right stop
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW);
   analogWrite(PWMA, pwm); analogWrite(PWMB, 0);
 }
 
-static void pivotLeft(int speed) { // Turn left -> right wheel fwd, left wheel stop
+static void pivotLeft(int speed) {
   int pwm = clampInt(abs(speed), 0, 255);
-  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);  // left stop
-  digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH); // right forward
+  digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW);
+  digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
   analogWrite(PWMA, 0); analogWrite(PWMB, pwm);
 }
 
@@ -126,6 +145,16 @@ unsigned long lastTime = 0;
 
 bool startSignal = false;
 bool killSignal = false;
+bool lastIrWasRepeat = false;
+
+enum IrAction {
+  IR_NONE,
+  IR_START_RIGHT_ACTION,
+  IR_START_LEFT_ACTION,
+  IR_STOP_ACTION
+};
+
+IrAction lastIrAction = IR_NONE;
 
 // State machine for maneuvers
 enum RobotState {
@@ -143,11 +172,107 @@ enum RobotState {
 RobotState robotState = SEARCHING;
 unsigned long maneuverStartTime = 0;
 
-void runRobotLogic(); // Function prototype
+void runRobotLogic();
+
+static bool isRawStartRight(uint32_t rawData) {
+  return rawData == IR_START_RIGHT_RAW ||
+         rawData == IR_START_RIGHT_RAW_ALT ||
+         rawData == IR_START_RIGHT_RAW_ALT2;
+}
+
+static bool isRawStartLeft(uint32_t rawData) {
+  return rawData == IR_START_LEFT_RAW ||
+         rawData == IR_START_LEFT_RAW_ALT;
+}
+//
+static bool isRawStop(uint32_t rawData) {
+  return rawData == IR_STOP_RAW ||
+         rawData == IR_STOP_RAW_ALT_SHORT ||
+         rawData == IR_STOP_RAW_ALT ||
+         rawData == IR_STOP_RAW_ALT2;
+}
+
+static bool rawContains16(uint32_t rawData, uint16_t value) {
+  return (uint16_t)(rawData & 0xFFFFUL) == value ||
+         (uint16_t)((rawData >> 16) & 0xFFFFUL) == value;
+}
+
+static bool rawContains8(uint32_t rawData, uint8_t value) {
+  return (uint8_t)(rawData & 0xFFUL) == value ||
+         (uint8_t)((rawData >> 8) & 0xFFUL) == value ||
+         (uint8_t)((rawData >> 16) & 0xFFUL) == value ||
+         (uint8_t)((rawData >> 24) & 0xFFUL) == value;
+}
+
+static void printIrDebug() {
+  Serial.print("IR p=");
+  Serial.print((int)IrReceiver.decodedIRData.protocol);
+  Serial.print(" a=0x");
+  Serial.print(IrReceiver.decodedIRData.address, HEX);
+  Serial.print(" c=0x");
+  Serial.print(IrReceiver.decodedIRData.command, HEX);
+  Serial.print(" raw=0x");
+  Serial.print(IrReceiver.decodedIRData.decodedRawData, HEX);
+  Serial.print(" f=0x");
+  Serial.println(IrReceiver.decodedIRData.flags, HEX);
+}
+
+static IrAction decodeIrAction() {
+  uint32_t rawData = IrReceiver.decodedIRData.decodedRawData;
+  uint16_t address = IrReceiver.decodedIRData.address;
+  uint16_t command = IrReceiver.decodedIRData.command;
+  uint8_t flags = IrReceiver.decodedIRData.flags;
+
+  if ((flags & IRDATA_FLAGS_IS_REPEAT) != 0 && lastIrAction != IR_NONE) {
+    lastIrWasRepeat = true;
+    return lastIrAction;
+  }
+
+  lastIrWasRepeat = false;
+
+  if (isRawStop(rawData) ||
+      rawContains16(rawData, IR_STOP_COMMAND_LONG) ||
+      rawContains16(rawData, IR_STOP_COMMAND_LONG_ALT) ||
+      rawContains8(rawData, IR_STOP_COMMAND_SHORT) ||
+      rawContains8(rawData, IR_STOP_COMMAND_SHORT_ALT) ||
+      ((address == IR_REMOTE_ADDRESS_SHORT || address == 0x0U) &&
+       (command == IR_STOP_COMMAND_SHORT ||
+        command == IR_STOP_COMMAND_SHORT_ALT ||
+        command == IR_STOP_COMMAND_LONG ||
+        command == IR_STOP_COMMAND_LONG_ALT))) {
+    return IR_STOP_ACTION;
+  }
+
+  if (isRawStartRight(rawData)) {
+    return IR_START_RIGHT_ACTION;
+  }
+
+  if (isRawStartLeft(rawData)) {
+    return IR_START_LEFT_ACTION;
+  }
+
+  return IR_NONE;
+}
+
+static void applyStart(int direction) {
+  startDirection = direction;
+  startSignal = true;
+  killSignal = false;
+  robotState = SEARCHING;
+  initialManeuverDone = false;
+}
+
+static void applyStop() {
+  killSignal = true;
+  startSignal = false;
+  initialManeuverDone = false;
+  robotState = SEARCHING;
+  stopMotors();
+}
 
 void setup() {
-   Serial.begin(115200);
-   Serial.println("Robot gotowy do wkurwiania. Zegar 8MHz OK."); // commented per request
+  Serial.begin(115200);
+  Serial.println("IR debug on");
 
   qtr.setTypeAnalog();
   qtr.setSensorPins((const uint8_t[]){A0, A1}, 2);
@@ -157,16 +282,14 @@ void setup() {
   qtr2.setSensorPins((const uint8_t[]){A4, A5}, 2);
   qtr2.setEmitterPin(255);
 
-  // calibrate
   for (uint8_t i = 0; i < 100; i++) { qtr.calibrate(); delay(20); }
   for (int i = 0; i < 400; i++) { qtr2.calibrate(); delay(1); }
 
-  // configure LED pins before any digitalWrite
   pinMode(led_red, OUTPUT);
   pinMode(led_green, OUTPUT);
   
   pinMode(IRDA, INPUT_PULLUP);
-  IrReceiver.begin(IRDA, ENABLE_LED_FEEDBACK);
+  IrReceiver.begin(IRDA, false);
 
   digitalWrite(led_red, HIGH);
   digitalWrite(led_green, LOW);
@@ -189,11 +312,9 @@ void setup() {
   pinMode(start_pin, INPUT);
   pinMode(kill_pin, INPUT);
 
-  // ensure red LED stays on at boot
   digitalWrite(led_red, HIGH);
   digitalWrite(led_green, LOW);
 
-  // configure PID
   pidSetpoint = 0.0;
   myPID.SetMode(AUTOMATIC);
   myPID.SetOutputLimits(-TURN_AMOUNT, TURN_AMOUNT);
@@ -201,37 +322,35 @@ void setup() {
 }
 
 void loop() {
-  // Check for IR commands as often as possible, outside the main logic loop
   if (IrReceiver.decode()) {
-    Serial.println(IrReceiver.decodedIRData.decodedRawData, HEX); // Print "old" raw data
-    // IrReceiver.printIRResultShort(&Serial); // Print complete received data in one line
-    // IrReceiver.printIRSendUsage(&Serial);   // Print the statement required to send this data
-    
-    if (IrReceiver.decodedIRData.decodedRawData == IR_START) {
-      //Serial.println("START");
-      startSignal = true;
-      killSignal = false;
-      // Reset state on start
-      robotState = SEARCHING;
-      initialManeuverDone = false; 
-    } else if (IrReceiver.decodedIRData.decodedRawData == IR_STOP) {
-      //Serial.println("STOP");
-      killSignal = true;
-      startSignal = false;
-    } else if (IrReceiver.decodedIRData.decodedRawData == IR_LEFT) {
-      //Serial.println("LEFT");
-      if (!startSignal) startDirection = -1; // Allow setting direction only before start
-    } else if (IrReceiver.decodedIRData.decodedRawData == IR_RIGHT) {
-      //Serial.println("RIGHT");
-      if (!startSignal) startDirection = 1; // Allow setting direction only before start
+    IrAction action = decodeIrAction();
+    printIrDebug();
+
+    if (action == IR_STOP_ACTION) {
+      lastIrAction = IR_STOP_ACTION;
+      applyStop();
+      if (lastIrWasRepeat) {
+        Serial.println("IR action: STOP repeat");
+      } else {
+        Serial.println("IR action: STOP");
+      }
+    } else if (action == IR_START_RIGHT_ACTION) {
+      lastIrAction = IR_START_RIGHT_ACTION;
+      applyStart(1);
+      Serial.println("IR action: START RIGHT");
+    } else if (action == IR_START_LEFT_ACTION) {
+      lastIrAction = IR_START_LEFT_ACTION;
+      applyStart(-1);
+      Serial.println("IR action: START LEFT");
+    } else {
+      lastIrAction = IR_NONE;
     }
     IrReceiver.resume();
   }
 
-  // Run the main robot logic at a fixed interval
   unsigned long now = millis();
   if (now - lastTime < LOOP_MS) {
-    return; // Not time yet
+    return;
   }
   lastTime = now;
 
@@ -240,7 +359,7 @@ void loop() {
     digitalWrite(led_green, HIGH);
     runRobotLogic();
   } else {
-    motor.forward(0);
+    stopMotors();
     bool ledState = (millis() / 500) % 2;
     digitalWrite(led_red, ledState ? HIGH : LOW);
     digitalWrite(led_green, LOW);
@@ -250,7 +369,6 @@ void loop() {
 void runRobotLogic() {
   unsigned long currentTime = millis();
 
-  // State machine for maneuvers
   switch (robotState) {
     case INITIAL_MANEUVER:
       if (startDirection == -1) spinCounterClockwise(SEARCH_SPEED);
@@ -261,9 +379,9 @@ void runRobotLogic() {
 
     case INITIAL_MANEUVER_STOP:
       if (currentTime - maneuverStartTime >= 350) {
-        motor.forward(0);
+        stopMotors();
         maneuverStartTime = currentTime;
-        robotState = SEARCHING; // Or a brief pause state
+        robotState = SEARCHING;
       }
       break;
 
@@ -311,7 +429,7 @@ void runRobotLogic() {
 
     case MANEUVER_STOP:
       if (currentTime - maneuverStartTime >= 300) { // Duration for pivot/spin
-        motor.forward(0);
+        stopMotors();
         maneuverStartTime = currentTime;
         robotState = SEARCHING;
       }
