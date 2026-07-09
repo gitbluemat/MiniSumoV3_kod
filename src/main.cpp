@@ -49,7 +49,6 @@
 
 // start module
 #define start_pin 4
-#define kill_pin 2
 
 // -1 = left, 1 = right, 0 = none/both
 int startDirection = 0;
@@ -144,7 +143,7 @@ int rightDetectCounter = 0;
 unsigned long lastTime = 0;
 
 bool startSignal = false;
-bool killSignal = false;
+bool lastStartPinState = false;
 bool lastIrWasRepeat = false;
 
 enum IrAction {
@@ -254,16 +253,13 @@ static IrAction decodeIrAction() {
   return IR_NONE;
 }
 
-static void applyStart(int direction) {
+static void setDirection(int direction) {
   startDirection = direction;
-  startSignal = true;
-  killSignal = false;
   robotState = SEARCHING;
   initialManeuverDone = false;
 }
 
 static void applyStop() {
-  killSignal = true;
   startSignal = false;
   initialManeuverDone = false;
   robotState = SEARCHING;
@@ -310,7 +306,6 @@ void setup() {
   pinMode(right_line, INPUT);
 
   pinMode(start_pin, INPUT);
-  pinMode(kill_pin, INPUT);
 
   digitalWrite(led_red, HIGH);
   digitalWrite(led_green, LOW);
@@ -336,17 +331,23 @@ void loop() {
       }
     } else if (action == IR_START_RIGHT_ACTION) {
       lastIrAction = IR_START_RIGHT_ACTION;
-      applyStart(1);
-      Serial.println("IR action: START RIGHT");
+      setDirection(1);
+      Serial.println("IR direction: RIGHT");
     } else if (action == IR_START_LEFT_ACTION) {
       lastIrAction = IR_START_LEFT_ACTION;
-      applyStart(-1);
-      Serial.println("IR action: START LEFT");
+      setDirection(-1);
+      Serial.println("IR direction: LEFT");
     } else {
       lastIrAction = IR_NONE;
     }
     IrReceiver.resume();
   }
+
+  bool currentStartPin = digitalRead(start_pin);
+  if (currentStartPin && !lastStartPinState) {
+    startSignal = true;
+  }
+  lastStartPinState = currentStartPin;
 
   unsigned long now = millis();
   if (now - lastTime < LOOP_MS) {
@@ -354,7 +355,7 @@ void loop() {
   }
   lastTime = now;
 
-  if(startSignal && !killSignal) {
+  if(startSignal) {
     digitalWrite(led_red, LOW);
     digitalWrite(led_green, HIGH);
     runRobotLogic();
